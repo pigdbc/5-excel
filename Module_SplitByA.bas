@@ -19,6 +19,7 @@ Public Sub SplitSheet1ByColumnA()
         keyA = Trim(CStr(wsSrc.Cells(r, "A").Value))
         If Len(keyA) > 0 Then
             Set wsDest = GetOrCreateSheet(keyA)
+            wsDest.Cells.NumberFormat = "@"
             nextRow = wsDest.Cells(wsDest.Rows.Count, "A").End(xlUp).Row
             If nextRow < 11 Then
                 nextRow = 11
