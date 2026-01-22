@@ -1,1 +1,0 @@
-.\Analyze-PlSqlInsert.ps1 -Path .\load_a_data.sql -TargetTable A -OutJson .\a_mapping.json
