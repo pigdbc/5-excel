@@ -1,0 +1,270 @@
+param(
+  [Parameter(Mandatory=$true)]
+  [string]$Path,
+
+  [string]$TargetTable = "A",
+  [string]$OutJson = ""
+)
+
+Set-StrictMode -Version Latest
+
+function Remove-OracleComments {
+  param([string]$Text)
+  # Remove /* ... */ blocks
+  $t = [regex]::Replace($Text, "/\*.*?\*/", "", "Singleline")
+  # Remove -- comments
+  $t = [regex]::Replace($t, "--.*?$", "", "Multiline")
+  return $t
+}
+
+function Normalize-Sql {
+  param([string]$Text)
+  # collapse whitespace but keep line breaks helpful for IF heuristic
+  $t = $Text -replace "`r", ""
+  $t = [regex]::Replace($t, "[\t ]+", " ")
+  return $t
+}
+
+function Split-TopLevelCommaList {
+  param([string]$Text)
+  # Split by commas not inside parentheses or quotes
+  $items = New-Object System.Collections.Generic.List[string]
+  $sb = New-Object System.Text.StringBuilder
+  $depth = 0
+  $inSingle = $false
+  $inDouble = $false
+
+  for ($i=0; $i -lt $Text.Length; $i++) {
+    $ch = $Text[$i]
+
+    if ($ch -eq "'" -and -not $inDouble) {
+      # handle escaped '' inside strings
+      if ($inSingle -and $i+1 -lt $Text.Length -and $Text[$i+1] -eq "'") {
+        [void]$sb.Append("''")
+        $i++
+        continue
+      }
+      $inSingle = -not $inSingle
+      [void]$sb.Append($ch)
+      continue
+    }
+    if ($ch -eq '"' -and -not $inSingle) {
+      $inDouble = -not $inDouble
+      [void]$sb.Append($ch)
+      continue
+    }
+
+    if (-not $inSingle -and -not $inDouble) {
+      if ($ch -eq "(") { $depth++; [void]$sb.Append($ch); continue }
+      if ($ch -eq ")") { if ($depth -gt 0) { $depth-- }; [void]$sb.Append($ch); continue }
+
+      if ($ch -eq "," -and $depth -eq 0) {
+        $items.Add($sb.ToString().Trim())
+        $null = $sb.Clear()
+        continue
+      }
+    }
+    [void]$sb.Append($ch)
+  }
+
+  $last = $sb.ToString().Trim()
+  if ($last.Length -gt 0) { $items.Add($last) }
+  return ,$items.ToArray()
+}
+
+function Extract-TablesFromFromClause {
+  param([string]$FromClause)
+
+  # Heuristic: find tokens after FROM/JOIN, stop at WHERE/GROUP/ORDER/HAVING/CONNECT/START
+  $tables = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
+
+  # Simplify: remove subquery bodies to avoid false positives (best-effort)
+  $work = $FromClause
+  # Replace "( select ... ) alias" with "(SUBQUERY) alias" at top-level parentheses (heuristic)
+  $work = [regex]::Replace($work, "$begin:math:text$\\s\*select\\b\.\*\?$end:math:text$", "(SUBQUERY)", "Singleline,IgnoreCase")
+
+  $pattern = '(?is)\b(from|join)\s+([a-z0-9_$#".@]+)(?:\s+[a-z0-9_$#"]+)?'
+  foreach ($m in [regex]::Matches($work, $pattern)) {
+    $t = $m.Groups[2].Value.Trim()
+    if ($t -and $t -ne "SUBQUERY") { [void]$tables.Add($t.Trim('"')) }
+  }
+
+  return ,$tables.ToArray()
+}
+
+function Get-NearbyIfCondition {
+  param(
+    [string[]]$Lines,
+    [int]$InsertLineIndex
+  )
+  # Look back up to N lines for the nearest IF ... THEN without an END IF between.
+  $maxBack = 30
+  $start = [Math]::Max(0, $InsertLineIndex - $maxBack)
+
+  $seenEndIf = $false
+  for ($i=$InsertLineIndex; $i -ge $start; $i--) {
+    $line = $Lines[$i].Trim()
+    if ($line -match '^\s*end\s+if\b') { $seenEndIf = $true }
+    if ($line -match '^\s*if\s+(.+?)\s+then\b') {
+      if (-not $seenEndIf) { return $Matches[1].Trim() }
+      # If we already saw END IF closer than this IF, then this IF doesn't guard this insert
+      return $null
+    }
+  }
+  return $null
+}
+
+# -------- main --------
+if (-not (Test-Path $Path)) { throw "File not found: $Path" }
+
+$raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+$noComments = Remove-OracleComments $raw
+$norm = Normalize-Sql $noComments
+
+# Keep line array for IF heuristic
+$lines = ($noComments -replace "`r","").Split("`n")
+
+$targetEsc = [regex]::Escape($TargetTable)
+
+$results = New-Object System.Collections.Generic.List[object]
+
+# 1) INSERT INTO A (cols) SELECT ...
+$insertSelectPattern = "(?is)\binsert\s+into\s+$targetEsc\s*$begin:math:text$\(\?\<cols\>\.\*\?\)$end:math:text$\s*select\s+(?<sels>.*?)\s+from\s+(?<from>.*?)(?<tail>\bwhere\b.*?|\bgroup\b.*?|\border\b.*?|\bhaving\b.*?|;)"
+foreach ($m in [regex]::Matches($norm, $insertSelectPattern)) {
+  $colsText = $m.Groups["cols"].Value
+  $selsText = $m.Groups["sels"].Value
+  $fromText = $m.Groups["from"].Value
+  $tailText = $m.Groups["tail"].Value
+
+  $cols = Split-TopLevelCommaList $colsText | ForEach-Object { $_.Trim().Trim('"') }
+  $sels = Split-TopLevelCommaList $selsText
+
+  $mapping = @()
+  $max = [Math]::Min($cols.Count, $sels.Count)
+  for ($i=0; $i -lt $max; $i++) {
+    $mapping += [pscustomobject]@{
+      column = $cols[$i]
+      expr   = $sels[$i].Trim()
+      kind   = (if ($sels[$i] -match "^\s*'") { "constant-string" }
+                elseif ($sels[$i] -match "^\s*\d+(\.\d+)?\s*$") { "constant-number" }
+                elseif ($sels[$i] -match "^\s*null\s*$") { "null" }
+                elseif ($sels[$i] -match "sysdate|systimestamp|current_date|current_timestamp") { "datetime-func" }
+                elseif ($sels[$i] -match "\bnextval\b") { "sequence" }
+                elseif ($sels[$i] -match "^:\w+") { "bind" }
+                else { "expression" })
+    }
+  }
+
+  $tables = Extract-TablesFromFromClause ("from " + $fromText + " " + $tailText)
+
+  $where = $null
+  if ($tailText -match "(?is)\bwhere\b(?<w>.*?)(\bgroup\b|\border\b|\bhaving\b|;|$)") {
+    $where = $Matches["w"].Trim()
+  }
+
+  $results.Add([pscustomobject]@{
+    type         = "insert-select"
+    target_table = $TargetTable
+    source_tables= $tables
+    where_clause = $where
+    if_guard     = $null  # filled later best-effort
+    columns      = $cols
+    select_exprs = $sels
+    mapping      = $mapping
+  })
+}
+
+# 2) INSERT INTO A (cols) VALUES (...)
+$insertValuesPattern = "(?is)\binsert\s+into\s+$targetEsc\s*$begin:math:text$\(\?\<cols\>\.\*\?\)$end:math:text$\s*values\s*$begin:math:text$\(\?\<vals\>\.\*\?\)$end:math:text$\s*;"
+foreach ($m in [regex]::Matches($norm, $insertValuesPattern)) {
+  $cols = Split-TopLevelCommaList $m.Groups["cols"].Value | ForEach-Object { $_.Trim().Trim('"') }
+  $vals = Split-TopLevelCommaList $m.Groups["vals"].Value
+
+  $mapping = @()
+  $max = [Math]::Min($cols.Count, $vals.Count)
+  for ($i=0; $i -lt $max; $i++) {
+    $mapping += [pscustomobject]@{
+      column = $cols[$i]
+      expr   = $vals[$i].Trim()
+      kind   = (if ($vals[$i] -match "^\s*'") { "constant-string" }
+                elseif ($vals[$i] -match "^\s*\d+(\.\d+)?\s*$") { "constant-number" }
+                elseif ($vals[$i] -match "^\s*null\s*$") { "null" }
+                elseif ($vals[$i] -match "sysdate|systimestamp|current_date|current_timestamp") { "datetime-func" }
+                elseif ($vals[$i] -match "\bnextval\b") { "sequence" }
+                elseif ($vals[$i] -match "^:\w+") { "bind" }
+                else { "expression/variable" })
+    }
+  }
+
+  $results.Add([pscustomobject]@{
+    type         = "insert-values"
+    target_table = $TargetTable
+    source_tables= @()   # values insert usually no FROM
+    where_clause = $null
+    if_guard     = $null
+    columns      = $cols
+    values       = $vals
+    mapping      = $mapping
+  })
+}
+
+# 3) IF guard heuristic: bind each insert to nearest IF above it
+# Find line numbers containing "insert into A"
+$insertLineIndexes = @()
+for ($i=0; $i -lt $lines.Length; $i++) {
+  if ($lines[$i] -match "(?i)\binsert\s+into\s+$targetEsc\b") {
+    $insertLineIndexes += $i
+  }
+}
+# Apply to results in same order (best-effort)
+for ($i=0; $i -lt [Math]::Min($results.Count, $insertLineIndexes.Count); $i++) {
+  $guard = Get-NearbyIfCondition -Lines $lines -InsertLineIndex $insertLineIndexes[$i]
+  if ($guard) { $results[$i].if_guard = $guard }
+}
+
+# Summarize A initial values = mapping where kind is constant/null/datetime/sequence/bind
+$initials = @()
+foreach ($r in $results) {
+  foreach ($m in $r.mapping) {
+    if ($m.kind -in @("constant-string","constant-number","null","datetime-func","sequence","bind")) {
+      $initials += [pscustomobject]@{
+        statement_type = $r.type
+        column = $m.column
+        initial_value_expr = $m.expr
+        kind = $m.kind
+      }
+    }
+  }
+}
+
+$outObj = [pscustomobject]@{
+  file = (Resolve-Path $Path).Path
+  target_table = $TargetTable
+  statements = $results
+  a_initial_values = $initials
+  all_source_tables = ($results.source_tables | Where-Object { $_ } | Select-Object -Unique)
+}
+
+# Console report (readable)
+"=== Target table: $TargetTable ==="
+"Statements found: $($results.Count)"
+"Source tables: " + (($outObj.all_source_tables -join ", ") ?? "(none)")
+""
+foreach ($st in $results) {
+  "---- $($st.type) ----"
+  if ($st.if_guard) { "IF guard: $($st.if_guard)" }
+  if ($st.source_tables.Count -gt 0) { "FROM/JOIN tables: " + ($st.source_tables -join ", ") }
+  if ($st.where_clause) { "WHERE: $($st.where_clause)" }
+  "Column mapping:"
+  foreach ($mp in $st.mapping) {
+    "  $($mp.column) <- $($mp.expr)   [$($mp.kind)]"
+  }
+  ""
+}
+
+# Export JSON if requested
+if ($OutJson -and $OutJson.Trim().Length -gt 0) {
+  $json = $outObj | ConvertTo-Json -Depth 10
+  Set-Content -LiteralPath $OutJson -Value $json -Encoding UTF8
+  "Saved JSON: $OutJson"
+}
