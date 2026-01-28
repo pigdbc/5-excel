@@ -1,10 +1,13 @@
-# Export_CE_To_ResultExcel.ps1
-# A=源文件名, B=Sheet名, C=源Sheet的C列(逐行), D空, E=源Sheet的E列(逐行)
+# Export_CE_FromRow7_MergeAware.ps1
+# 从每个工作表第7行开始导出：
+# A=文件名 B=sheet名 C=源Sheet的C列(支持合并单元格按显示填充) D空 E=源Sheet的E列(同样支持合并)
 # 输出 result.xlsx
+# 需要本机安装 Microsoft Excel（COM）
 
 param(
     [string]$Root = (Get-Location).Path,
-    [string]$OutXlsx = "result.xlsx"
+    [string]$OutXlsx = "result.xlsx",
+    [int]$StartRow = 7
 )
 
 Set-StrictMode -Version Latest
@@ -16,26 +19,27 @@ function Release-ComObject([object]$o) {
     }
 }
 
-# 1) 找Excel文件（过滤掉临时锁文件）
+# 找 Excel 文件（包含子文件夹，过滤临时锁文件）
 $excelFiles = Get-ChildItem -Path $Root -Recurse -File -Include *.xlsx, *.xlsm, *.xls |
     Where-Object { $_.Name -notlike "~$*" }
 
+Write-Host "扫描目录: $Root"
+Write-Host "找到 Excel 文件数: $($excelFiles.Count)"
+
 if ($excelFiles.Count -eq 0) {
-    Write-Host "未找到 Excel 文件：$Root"
+    Write-Host "没有找到任何 Excel。"
     exit 0
 }
 
-# 2) 启动Excel
 $excel = New-Object -ComObject Excel.Application
 $excel.Visible = $false
 $excel.DisplayAlerts = $false
 
-# 3) 新建结果工作簿
 $outWb = $excel.Workbooks.Add()
 $outWs = $outWb.Worksheets.Item(1)
 $outWs.Name = "result"
 
-# 表头（可删）
+# 表头
 $outWs.Cells.Item(1,1).Value2 = "FileName"
 $outWs.Cells.Item(1,2).Value2 = "Sheet"
 $outWs.Cells.Item(1,3).Value2 = "ColC"
@@ -53,60 +57,109 @@ try {
             foreach ($ws in $wb.Worksheets) {
                 $sheetName = $ws.Name
 
-                # 用 UsedRange 决定要导出的行范围
-                $used = $null
-                try { $used = $ws.UsedRange } catch { $used = $null }
-                if ($null -eq $used) { Release-ComObject $ws; continue }
+                # 找最后一个非空单元格，确定 lastRow
+                $lastCell = $ws.Cells.Find(
+                    "*",
+                    $ws.Cells.Item(1,1),
+                    -4163,   # xlValues
+                    1,       # xlPart
+                    1,       # xlByRows
+                    2,       # xlPrevious
+                    $false
+                )
 
-                $firstRow = $used.Row
-                $rowCount = $used.Rows.Count
-                if ($rowCount -lt 1) { Release-ComObject $used; Release-ComObject $ws; continue }
+                if ($null -eq $lastCell) {
+                    Release-ComObject $ws
+                    continue
+                }
 
-                $lastRow = $firstRow + $rowCount - 1
+                $lastRow = $lastCell.Row
+                Release-ComObject $lastCell
 
-                # 一次性读取 C 和 E 两列
-                $rngC = $ws.Range("C$firstRow:C$lastRow")
-                $rngE = $ws.Range("E$firstRow:E$lastRow")
-                $valC = $rngC.Value2
-                $valE = $rngE.Value2
+                if ($lastRow -lt $StartRow) {
+                    Release-ComObject $ws
+                    continue
+                }
 
-                # 把 Range.Value2 统一转成“按行取值”的方式
-                # 多行时是二维数组 [1..n,1..1]，单行时可能是 scalar
-                if ($valC -is [System.Array] -and $valC.Rank -eq 2) {
-                    $rMin = $valC.GetLowerBound(0); $rMax = $valC.GetUpperBound(0)
+                # 一次性读 C:E（3列），从第7行开始
+                $rng = $ws.Range("C$StartRow:E$lastRow")
+                $vals = $rng.Value2
+
+                # 合并填充用的“区间缓存”（避免每行都去问 MergeArea）
+                $carryCValue = ""
+                $carryCUntil = 0
+                $carryEValue = ""
+                $carryEUntil = 0
+
+                if ($vals -is [System.Array] -and $vals.Rank -eq 2) {
+                    $rMin = $vals.GetLowerBound(0); $rMax = $vals.GetUpperBound(0)
+
                     for ($ri = $rMin; $ri -le $rMax; $ri++) {
-                        $cStr = $valC[$ri, 1]
-                        $eStr = $null
-                        if ($valE -is [System.Array] -and $valE.Rank -eq 2) {
-                            $eStr = $valE[$ri, 1]
-                        } else {
-                            $eStr = $valE
+                        $actualRow = $StartRow + ($ri - $rMin)
+
+                        # C:E => 1=C, 2=D(忽略), 3=E
+                        $cVal = $vals[$ri, 1]
+                        $eVal = $vals[$ri, 3]
+
+                        # --- 处理 C 列合并 ---
+                        $cOut = ""
+                        if ($null -ne $cVal -and [string]$cVal -ne "") {
+                            $cOut = [string]$cVal
+                            $carryCValue = $cOut
+                            $carryCUntil = 0
+                        }
+                        elseif ($actualRow -le $carryCUntil -and $carryCValue -ne "") {
+                            # 在已知合并区间内，填充
+                            $cOut = $carryCValue
+                        }
+                        else {
+                            # 检查这一行的 C 单元格是否处于合并区域
+                            $cellC = $ws.Cells.Item($actualRow, 3)
+                            if ($cellC.MergeCells) {
+                                $area = $cellC.MergeArea
+                                $topVal = $area.Cells.Item(1,1).Value2
+                                $cOut = if ($null -ne $topVal) { [string]$topVal } else { "" }
+                                $carryCValue = $cOut
+                                $carryCUntil = $area.Row + $area.Rows.Count - 1
+                                Release-ComObject $area
+                            }
+                            Release-ComObject $cellC
                         }
 
-                        # 可选：如果 C 和 E 都空，就不写（不想过滤就删掉这个 if）
-                        if ($null -eq $cStr -and $null -eq $eStr) { continue }
+                        # --- 处理 E 列合并（可选但更稳）---
+                        $eOut = ""
+                        if ($null -ne $eVal -and [string]$eVal -ne "") {
+                            $eOut = [string]$eVal
+                            $carryEValue = $eOut
+                            $carryEUntil = 0
+                        }
+                        elseif ($actualRow -le $carryEUntil -and $carryEValue -ne "") {
+                            $eOut = $carryEValue
+                        }
+                        else {
+                            $cellE = $ws.Cells.Item($actualRow, 5)
+                            if ($cellE.MergeCells) {
+                                $areaE = $cellE.MergeArea
+                                $topValE = $areaE.Cells.Item(1,1).Value2
+                                $eOut = if ($null -ne $topValE) { [string]$topValE } else { "" }
+                                $carryEValue = $eOut
+                                $carryEUntil = $areaE.Row + $areaE.Rows.Count - 1
+                                Release-ComObject $areaE
+                            }
+                            Release-ComObject $cellE
+                        }
 
+                        # 写入结果
                         $outWs.Cells.Item($outRow, 1).Value2 = $f.Name
                         $outWs.Cells.Item($outRow, 2).Value2 = $sheetName
-                        $outWs.Cells.Item($outRow, 3).Value2 = if ($null -ne $cStr) { [string]$cStr } else { "" }
-                        # D列留空
-                        $outWs.Cells.Item($outRow, 5).Value2 = if ($null -ne $eStr) { [string]$eStr } else { "" }
-                        $outRow++
-                    }
-                } else {
-                    # 单行/单格退化情况
-                    if ($null -ne $valC -or $null -ne $valE) {
-                        $outWs.Cells.Item($outRow, 1).Value2 = $f.Name
-                        $outWs.Cells.Item($outRow, 2).Value2 = $sheetName
-                        $outWs.Cells.Item($outRow, 3).Value2 = if ($null -ne $valC) { [string]$valC } else { "" }
-                        $outWs.Cells.Item($outRow, 5).Value2 = if ($null -ne $valE) { [string]$valE } else { "" }
+                        $outWs.Cells.Item($outRow, 3).Value2 = $cOut
+                        # D 空着
+                        $outWs.Cells.Item($outRow, 5).Value2 = $eOut
                         $outRow++
                     }
                 }
 
-                Release-ComObject $rngC
-                Release-ComObject $rngE
-                Release-ComObject $used
+                Release-ComObject $rng
                 Release-ComObject $ws
             }
 
@@ -114,7 +167,7 @@ try {
             Release-ComObject $wb
         }
         catch {
-            # 如果某个文件打不开，也写一行错误到结果里
+            # 文件打不开/被锁/损坏：写一行错误
             $outWs.Cells.Item($outRow, 1).Value2 = $f.Name
             $outWs.Cells.Item($outRow, 2).Value2 = ""
             $outWs.Cells.Item($outRow, 3).Value2 = "ERROR: $($_.Exception.Message)"
@@ -128,12 +181,9 @@ try {
         }
     }
 
-    # 简单美化：自动列宽
     $outWs.Columns.AutoFit() | Out-Null
 
-    # 保存
     $outPath = Join-Path $Root $OutXlsx
-    # 如果已存在，先删掉避免 SaveAs 异常
     if (Test-Path $outPath) { Remove-Item -Force $outPath }
     $outWb.SaveAs($outPath) | Out-Null
 
