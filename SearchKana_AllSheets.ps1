@@ -1,35 +1,48 @@
-# SearchKana_Fast.ps1
-# 递归搜索 Excel：所有工作表的 C/D 列中查找包含「カナ」的单元格（数组扫描，速度快）
-# 输出到 result.csv / result.txt （UTF-8 with BOM，日文不乱码）
-# 需要本机安装 Microsoft Excel（COM）
+# Export_CE_To_ResultExcel.ps1
+# A=源文件名, B=Sheet名, C=源Sheet的C列(逐行), D空, E=源Sheet的E列(逐行)
+# 输出 result.xlsx
 
 param(
     [string]$Root = (Get-Location).Path,
-    [string]$Keyword = "カナ",
-    [string]$OutCsv = "result.csv",
-    [string]$OutTxt = "result.txt"
+    [string]$OutXlsx = "result.xlsx"
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
-
-$results = New-Object System.Collections.Generic.List[object]
-$excelFiles = Get-ChildItem -Path $Root -Recurse -File -Include *.xlsx, *.xlsm, *.xls
-
-if ($excelFiles.Count -eq 0) {
-    Write-Host "未找到 Excel 文件：$Root"
-    exit 0
-}
-
-$excel = New-Object -ComObject Excel.Application
-$excel.Visible = $false
-$excel.DisplayAlerts = $false
 
 function Release-ComObject([object]$o) {
     if ($null -ne $o) {
         try { [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($o) } catch {}
     }
 }
+
+# 1) 找Excel文件（过滤掉临时锁文件）
+$excelFiles = Get-ChildItem -Path $Root -Recurse -File -Include *.xlsx, *.xlsm, *.xls |
+    Where-Object { $_.Name -notlike "~$*" }
+
+if ($excelFiles.Count -eq 0) {
+    Write-Host "未找到 Excel 文件：$Root"
+    exit 0
+}
+
+# 2) 启动Excel
+$excel = New-Object -ComObject Excel.Application
+$excel.Visible = $false
+$excel.DisplayAlerts = $false
+
+# 3) 新建结果工作簿
+$outWb = $excel.Workbooks.Add()
+$outWs = $outWb.Worksheets.Item(1)
+$outWs.Name = "result"
+
+# 表头（可删）
+$outWs.Cells.Item(1,1).Value2 = "FileName"
+$outWs.Cells.Item(1,2).Value2 = "Sheet"
+$outWs.Cells.Item(1,3).Value2 = "ColC"
+$outWs.Cells.Item(1,4).Value2 = ""      # D 空
+$outWs.Cells.Item(1,5).Value2 = "ColE"
+
+$outRow = 2
 
 try {
     foreach ($f in $excelFiles) {
@@ -40,7 +53,7 @@ try {
             foreach ($ws in $wb.Worksheets) {
                 $sheetName = $ws.Name
 
-                # 用 UsedRange 推断实际行范围（比扫整列快）
+                # 用 UsedRange 决定要导出的行范围
                 $used = $null
                 try { $used = $ws.UsedRange } catch { $used = $null }
                 if ($null -eq $used) { Release-ComObject $ws; continue }
@@ -51,58 +64,48 @@ try {
 
                 $lastRow = $firstRow + $rowCount - 1
 
-                # 一次性读 C:D（两列）
-                $range = $ws.Range("C$firstRow:D$lastRow")
-                $vals  = $range.Value2
+                # 一次性读取 C 和 E 两列
+                $rngC = $ws.Range("C$firstRow:C$lastRow")
+                $rngE = $ws.Range("E$firstRow:E$lastRow")
+                $valC = $rngC.Value2
+                $valE = $rngE.Value2
 
-                # Value2 可能返回：
-                # - 2D object[,]（多行）
-                # - scalar（只有一个单元格时）
-                # 我们统一处理
-                if ($vals -is [System.Array] -and $vals.Rank -eq 2) {
-                    $rMin = $vals.GetLowerBound(0); $rMax = $vals.GetUpperBound(0)
-                    $cMin = $vals.GetLowerBound(1); $cMax = $vals.GetUpperBound(1) # 理论上是 2 列
-
+                # 把 Range.Value2 统一转成“按行取值”的方式
+                # 多行时是二维数组 [1..n,1..1]，单行时可能是 scalar
+                if ($valC -is [System.Array] -and $valC.Rank -eq 2) {
+                    $rMin = $valC.GetLowerBound(0); $rMax = $valC.GetUpperBound(0)
                     for ($ri = $rMin; $ri -le $rMax; $ri++) {
-                        for ($ci = $cMin; $ci -le $cMax; $ci++) {
-                            $v = $vals[$ri, $ci]
-                            if ($null -ne $v) {
-                                $s = [string]$v
-                                if ($s -like "*$Keyword*") {
-                                    $actualRow = $firstRow + ($ri - $rMin)
-                                    $colLetter = if (($ci - $cMin) -eq 0) { "C" } else { "D" }
+                        $cStr = $valC[$ri, 1]
+                        $eStr = $null
+                        if ($valE -is [System.Array] -and $valE.Rank -eq 2) {
+                            $eStr = $valE[$ri, 1]
+                        } else {
+                            $eStr = $valE
+                        }
 
-                                    $results.Add([pscustomobject]@{
-                                        FileName = $f.Name
-                                        FullPath = $f.FullName
-                                        Sheet    = $sheetName
-                                        Row      = $actualRow
-                                        Column   = $colLetter
-                                        Value    = $s
-                                    })
-                                }
-                            }
-                        }
+                        # 可选：如果 C 和 E 都空，就不写（不想过滤就删掉这个 if）
+                        if ($null -eq $cStr -and $null -eq $eStr) { continue }
+
+                        $outWs.Cells.Item($outRow, 1).Value2 = $f.Name
+                        $outWs.Cells.Item($outRow, 2).Value2 = $sheetName
+                        $outWs.Cells.Item($outRow, 3).Value2 = if ($null -ne $cStr) { [string]$cStr } else { "" }
+                        # D列留空
+                        $outWs.Cells.Item($outRow, 5).Value2 = if ($null -ne $eStr) { [string]$eStr } else { "" }
+                        $outRow++
                     }
-                }
-                else {
-                    # 只有一个单元格的极端情况：它就是 C(firstRow)
-                    if ($null -ne $vals) {
-                        $s = [string]$vals
-                        if ($s -like "*$Keyword*") {
-                            $results.Add([pscustomobject]@{
-                                FileName = $f.Name
-                                FullPath = $f.FullName
-                                Sheet    = $sheetName
-                                Row      = $firstRow
-                                Column   = "C"   # 单格情况下 Range 从 C:D 仍可能退化，按 C 记录
-                                Value    = $s
-                            })
-                        }
+                } else {
+                    # 单行/单格退化情况
+                    if ($null -ne $valC -or $null -ne $valE) {
+                        $outWs.Cells.Item($outRow, 1).Value2 = $f.Name
+                        $outWs.Cells.Item($outRow, 2).Value2 = $sheetName
+                        $outWs.Cells.Item($outRow, 3).Value2 = if ($null -ne $valC) { [string]$valC } else { "" }
+                        $outWs.Cells.Item($outRow, 5).Value2 = if ($null -ne $valE) { [string]$valE } else { "" }
+                        $outRow++
                     }
                 }
 
-                Release-ComObject $range
+                Release-ComObject $rngC
+                Release-ComObject $rngE
                 Release-ComObject $used
                 Release-ComObject $ws
             }
@@ -111,14 +114,12 @@ try {
             Release-ComObject $wb
         }
         catch {
-            $results.Add([pscustomobject]@{
-                FileName = $f.Name
-                FullPath = $f.FullName
-                Sheet    = ""
-                Row      = ""
-                Column   = ""
-                Value    = "ERROR: $($_.Exception.Message)"
-            })
+            # 如果某个文件打不开，也写一行错误到结果里
+            $outWs.Cells.Item($outRow, 1).Value2 = $f.Name
+            $outWs.Cells.Item($outRow, 2).Value2 = ""
+            $outWs.Cells.Item($outRow, 3).Value2 = "ERROR: $($_.Exception.Message)"
+            $outWs.Cells.Item($outRow, 5).Value2 = ""
+            $outRow++
 
             if ($wb -ne $null) {
                 try { $wb.Close($false) | Out-Null } catch {}
@@ -126,30 +127,27 @@ try {
             }
         }
     }
+
+    # 简单美化：自动列宽
+    $outWs.Columns.AutoFit() | Out-Null
+
+    # 保存
+    $outPath = Join-Path $Root $OutXlsx
+    # 如果已存在，先删掉避免 SaveAs 异常
+    if (Test-Path $outPath) { Remove-Item -Force $outPath }
+    $outWb.SaveAs($outPath) | Out-Null
+
+    Write-Host "完成：写入行数 = $($outRow - 2)"
+    Write-Host "输出文件：$outPath"
 }
 finally {
+    try { $outWb.Close($true) | Out-Null } catch {}
+    Release-ComObject $outWs
+    Release-ComObject $outWb
+
     try { $excel.Quit() } catch {}
     Release-ComObject $excel
+
     [GC]::Collect(); [GC]::WaitForPendingFinalizers()
     [GC]::Collect(); [GC]::WaitForPendingFinalizers()
 }
-
-# 写文件：UTF-8 BOM（Excel/记事本都不乱码）
-$utf8Bom = New-Object System.Text.UTF8Encoding($true)
-
-# CSV（Excel 直接打开）
-$csvText = $results | ConvertTo-Csv -NoTypeInformation
-[System.IO.File]::WriteAllLines((Join-Path $Root $OutCsv), $csvText, $utf8Bom)
-
-# TXT（制表符分隔）
-$txtLines = New-Object System.Collections.Generic.List[string]
-$txtLines.Add("FileName`tFullPath`tSheet`tRow`tColumn`tValue")
-foreach ($x in $results) {
-    $v = ($x.Value -replace "(\r\n|\n|\r)", " ")
-    $txtLines.Add("$($x.FileName)`t$($x.FullPath)`t$($x.Sheet)`t$($x.Row)`t$($x.Column)`t$v")
-}
-[System.IO.File]::WriteAllLines((Join-Path $Root $OutTxt), $txtLines, $utf8Bom)
-
-Write-Host "完成：命中 $($results.Count) 条"
-Write-Host "CSV: $(Join-Path $Root $OutCsv)"
-Write-Host "TXT: $(Join-Path $Root $OutTxt)"
